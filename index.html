@@ -1,0 +1,685 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Rail Runner — Jump-on-Trains, Stones-only Fail</title>
+  <style>
+    :root{ --bg:#0e1124; --ui:#141a3d; --text:#eaf2ff; }
+    html,body{margin:0;height:100%;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial}
+    #menu,#highscore{
+      position:fixed; inset:0; display:flex; flex-direction:column;
+      align-items:center; justify-content:center;
+      background:linear-gradient(180deg,#0e1124,#121744)
+    }
+    h1,h2{margin:8px 0}
+    p{opacity:.9;max-width:700px;text-align:center}
+    .btn{padding:12px 18px;margin:8px;border-radius:10px;border:1px solid #28305f;background:var(--ui);color:var(--text);font-weight:600}
+    .btn:hover{background:#1a2150}
+    #hud{
+      position:fixed; top:10px; left:10px; display:flex; gap:12px;
+      background:rgba(20,26,61,.6); padding:8px 10px; border-radius:8px
+    }
+    #hud span{font-size:14px}
+    #game{width:100%;height:100%;display:none}
+    #hint{position:fixed;bottom:10px;left:50%;transform:translateX(-50%);background:rgba(20,26,61,.6);padding:6px 10px;border-radius:8px;font-size:12px;display:none}
+  </style>
+</head>
+<body>
+
+  <!-- MENU -->
+  <div id="menu">
+    <h1>Rail Runner</h1>
+    <p>
+      Mobile-friendly 3D lane runner. Swipe: Up to jump, Down to slide, Left/Right to change tracks.
+      Jump onto train tops and wide platforms. Slide under barricades. Collect coins.
+      Only stepping on brown ground stones ends the run.
+    </p>
+    <button class="btn" onclick="startGame()">Start Game</button>
+    <button class="btn" onclick="showHighScore()">High Score</button>
+    <button class="btn" onclick="exitGame()">Exit</button>
+  </div>
+
+  <!-- HIGH SCORE -->
+  <div id="highscore" style="display:none;">
+    <h2>High Score</h2>
+    <p id="bestScoreText">Best: 0</p>
+    <button class="btn" onclick="backToMenu()">Back</button>
+  </div>
+
+  <!-- GAME + HUD -->
+  <div id="hud" style="display:none;">
+    <span id="scoreText">Score: 0</span>
+    <span id="coinsText">Coins: 0</span>
+    <span id="speedText">Speed: 6</span>
+    <span id="bestText">Best: 0</span>
+  </div>
+  <div id="hint">Swipe: Up=Jump, Down=Slide, Left/Right=Tracks</div>
+  <div id="game"></div>
+
+  <!-- Three.js -->
+  <script src="https://unpkg.com/three@0.159.0/build/three.min.js"></script>
+  <script>
+    /* UI elements */
+    const menu = document.getElementById('menu');
+    const highscore = document.getElementById('highscore');
+    const gameDiv = document.getElementById('game');
+    const hud = document.getElementById('hud');
+    const hint = document.getElementById('hint');
+    const scoreText = document.getElementById('scoreText');
+    const coinsText = document.getElementById('coinsText');
+    const speedText = document.getElementById('speedText');
+    const bestText = document.getElementById('bestText');
+    const bestScoreText = document.getElementById('bestScoreText');
+
+    /* Persistent best score */
+    let best = Number(localStorage.getItem('railRunnerBest') || 0);
+    bestText.textContent = 'Best: ' + best;
+    bestScoreText.textContent = 'Best: ' + best;
+
+    /* Three.js core */
+    let scene, camera, renderer, clock;
+    let running = false;
+
+    /* Lanes/tracks */
+    const LANES = [-2.2, 0, 2.2];
+
+    /* Player */
+    let player, playerLane = 1;
+    let vy = 0;
+    let isJumping = false, isSliding = false, slideTimer = 0;
+    let onPlatform = false;           // true when standing on a train top or platform
+    let currentPlatform = null;       // { kind: 'train'|'platform', ref: Mesh, topY: number }
+    const FLOOR_Y = 0.8;
+    const GRAVITY = -32;
+    const JUMP_V = 13.8;
+
+    /* Game state */
+    let speed = 6; // gentle start
+    let score = 0;
+    let coins = 0;
+    let trains = [];       // jumpable trains (safe)
+    let barricades = [];   // slide-under (no death)
+    let stones = [];       // brown circles (only fail cause)
+    let platforms = [];    // static wide platforms
+    let coinMeshes = [];
+    let envSegments = [];
+
+    /* Timers */
+    let trainTimer = 0, coinTimer = 0, stoneTimer = 0, barricadeTimer = 0, platformTimer = 0, difficultyTimer = 0;
+
+    /* Setup Three.js */
+    function initThree(){
+      scene = new THREE.Scene();
+      scene.fog = new THREE.Fog(0x10163f, 12, 90);
+
+      camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 240);
+      camera.position.set(0, 4.2, 8);
+      camera.lookAt(0, 1.6, 0);
+
+      renderer = new THREE.WebGLRenderer({antialias:true});
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      gameDiv.appendChild(renderer.domElement);
+
+      clock = new THREE.Clock();
+
+      window.addEventListener('resize', ()=>{
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      });
+    }
+
+    /* Lights */
+    function createLighting(){
+      const hemi = new THREE.HemisphereLight(0xbbe9ff, 0x2a3018, 1.0);
+      scene.add(hemi);
+      const dir = new THREE.DirectionalLight(0xffffff, 0.8);
+      dir.position.set(6, 10, 6);
+      scene.add(dir);
+    }
+
+    /* Tracks */
+    function createTracks(){
+      const group = new THREE.Group();
+      const trackGeom = new THREE.BoxGeometry(2.3, 0.2, 24);
+      const colors = [0x3aaef0, 0x54c1f5, 0x3aaef0];
+      LANES.forEach((x, i)=>{
+        const mat = new THREE.MeshLambertMaterial({color: colors[i]});
+        const mesh = new THREE.Mesh(trackGeom, mat);
+        mesh.position.set(x, 0, -7);
+        group.add(mesh);
+      });
+      scene.add(group);
+    }
+
+    /* Player: simple humanoid proxy */
+    function createPlayer(){
+      const group = new THREE.Group();
+
+      const torso = new THREE.Mesh(
+        new THREE.BoxGeometry(0.6, 1.2, 0.35),
+        new THREE.MeshPhongMaterial({color:0x2e7dd7, shininess:40})
+      );
+      torso.position.set(0, 1.2, 0);
+      group.add(torso);
+
+      const head = new THREE.Mesh(
+        new THREE.SphereGeometry(0.25, 16, 16),
+        new THREE.MeshPhongMaterial({color:0xffe0bd})
+      );
+      head.position.set(0, 1.9, 0.06);
+      group.add(head);
+
+      group.position.set(LANES[playerLane], FLOOR_Y, 0);
+      player = group;
+      scene.add(player);
+    }
+
+    /* Trains: single-car jumpable tops (safe) */
+    function spawnTrain(){
+      const laneIndex = Math.floor(Math.random()*LANES.length);
+      const x = LANES[laneIndex];
+
+      const carLen = 2.4;                          // longer car for a usable deck
+      const carHeight = 1.25 + Math.random()*0.35; // top height for landing
+
+      const body = new THREE.Mesh(
+        new THREE.BoxGeometry(0.95, carHeight, carLen),
+        new THREE.MeshPhongMaterial({color:0xFF5E5B, emissive:0x250000})
+      );
+      body.position.set(x, carHeight/2, -22);
+
+      // roof stripe for visual clarity
+      const stripe = new THREE.Mesh(
+        new THREE.BoxGeometry(0.96, 0.08, carLen*0.95),
+        new THREE.MeshPhongMaterial({color:0xFFC857})
+      );
+      stripe.position.set(0, carHeight/2 + 0.04, 0);
+      body.add(stripe);
+
+      body.userData = { type:'train', topY: carHeight, len: carLen };
+      scene.add(body);
+      trains.push(body);
+    }
+
+    /* Barricades: slide-under (no death; bump slows you) */
+    function spawnBarricade(){
+      const laneIndex = Math.floor(Math.random()*LANES.length);
+      const x = LANES[laneIndex];
+      const bar = new THREE.Mesh(
+        new THREE.BoxGeometry(0.9, 0.35, 0.65),
+        new THREE.MeshPhongMaterial({color:0xFFA500})
+      );
+      bar.position.set(x, 0.95, -20);
+      bar.userData = { type:'barricade' };
+      scene.add(bar);
+      barricades.push(bar);
+    }
+
+    /* Coins: frequent pickups */
+    function spawnCoinsRow(){
+      const laneIndex = Math.floor(Math.random()*LANES.length);
+      const x = LANES[laneIndex];
+      const count = 7;
+      for(let i=0;i<count;i++){
+        const coin = new THREE.Mesh(
+          new THREE.CylinderGeometry(0.16,0.16,0.05,24),
+          new THREE.MeshPhongMaterial({color:0xFFD700, emissive:0x442200, shininess:80})
+        );
+        coin.rotation.x = Math.PI/2;
+        coin.position.set(x, 1.05 + Math.random()*0.25, -20 - i*1.05);
+        coin.userData = { type:'coin' };
+        scene.add(coin);
+        coinMeshes.push(coin);
+      }
+    }
+
+    /* Stones: small brown circles on ground (ONLY fail cause) */
+    function spawnStone(){
+      if(Math.random() > 0.35) return; // keep rare
+      const laneIndex = Math.floor(Math.random()*LANES.length);
+      const x = LANES[laneIndex];
+      const stone = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.18,0.18,0.08,32),
+        new THREE.MeshLambertMaterial({color:0x6b3f1d})
+      );
+      stone.rotation.x = Math.PI/2; // flat circle on ground
+      stone.position.set(x, 0.08, -20);
+      stone.userData = { type:'stone' };
+      scene.add(stone);
+      stones.push(stone);
+    }
+
+    /* Static platforms: wide jumpable blocks (optional variety) */
+    function spawnPlatform(){
+      const laneIndex = Math.floor(Math.random()*LANES.length);
+      const x = LANES[laneIndex];
+      const length = 6 + Math.random()*3;
+      const height = 1.2;
+      const platform = new THREE.Mesh(
+        new THREE.BoxGeometry(1.8, 0.4, length),
+        new THREE.MeshLambertMaterial({color:0x8a8f9c})
+      );
+      platform.position.set(x, height, -22);
+      platform.userData = { type:'platform', topY: height + 0.2, len: length };
+      scene.add(platform);
+      platforms.push(platform);
+    }
+
+    /* Controls: swipe + keyboard */
+    let touchStartX=0, touchStartY=0, touchEndX=0, touchEndY=0;
+    const SWIPE_THRESHOLD = 35;
+
+    function onTouchStart(e){
+      const t = e.touches[0];
+      touchStartX = t.clientX; touchStartY = t.clientY;
+    }
+    function onTouchEnd(e){
+      const t = e.changedTouches[0];
+      touchEndX = t.clientX; touchEndY = t.clientY;
+      const dx = touchEndX - touchStartX;
+      const dy = touchEndY - touchStartY;
+      if(Math.abs(dx) > Math.abs(dy)){
+        if(dx > SWIPE_THRESHOLD) laneRight();
+        else if(dx < -SWIPE_THRESHOLD) laneLeft();
+      } else {
+        if(dy < -SWIPE_THRESHOLD) jump();
+        else if(dy > SWIPE_THRESHOLD) slide();
+      }
+    }
+    function onKeyDown(e){
+      if(!running) return;
+      if(e.code==='ArrowLeft' || e.code==='KeyA') laneLeft();
+      if(e.code==='ArrowRight'|| e.code==='KeyD') laneRight();
+      if(e.code==='ArrowUp'   || e.code==='Space') jump();
+      if(e.code==='ArrowDown' || e.code==='KeyS') slide();
+    }
+
+    function laneLeft(){ if(playerLane > 0) playerLane--; }
+    function laneRight(){ if(playerLane < LANES.length-1) playerLane++; }
+    function jump(){
+      if(!isJumping){
+        isJumping = true;
+        onPlatform = false;
+        currentPlatform = null;
+        vy = JUMP_V;
+      }
+    }
+    function slide(){
+      if(!isSliding && !isJumping){
+        isSliding = true;
+        slideTimer = 0.55;
+      }
+    }
+
+    /* Helpers */
+    function hudUpdate(){
+      scoreText.textContent = 'Score: ' + score;
+      coinsText.textContent = 'Coins: ' + coins;
+      speedText.textContent = 'Speed: ' + speed.toFixed(1);
+      bestText.textContent  = 'Best: ' + best;
+    }
+    function aabbIntersect(a,b, pad=0){
+      return (Math.abs(a.x - b.x) < (a.w + b.w)*0.5 - pad) &&
+             (Math.abs(a.y - b.y) < (a.h + b.h)*0.5 - pad) &&
+             (Math.abs(a.z - b.z) < (a.d + b.d)*0.5 - pad);
+    }
+
+    /* Train top landing (safe platform) */
+    function handleTrainLanding(){
+      if(vy >= 0) return; // only when descending
+
+      for(const tr of trains){
+        const topY = tr.userData.topY;
+        const len = tr.userData.len;
+        const halfLen = len/2;
+
+        const withinLane = Math.abs(player.position.x - tr.position.x) < 0.9;
+        const withinZ    = Math.abs(player.position.z - tr.position.z) < (halfLen + 0.35);
+        const closeTop   = Math.abs(player.position.y - topY) < 0.20;
+
+        if(withinLane && withinZ && closeTop){
+          player.position.y = topY;
+          vy = 0;
+          isJumping = false;
+          onPlatform = true;
+          currentPlatform = { kind:'train', ref: tr, topY };
+          return;
+        }
+      }
+    }
+
+    /* Static platform landing */
+    function handlePlatformLanding(){
+      if(vy >= 0) return;
+
+      for(const pf of platforms){
+        const topY = pf.userData.topY;
+        const halfLen = pf.userData.len / 2;
+
+        const withinLane = Math.abs(player.position.x - pf.position.x) < 0.9;
+        const withinZ    = Math.abs(player.position.z - pf.position.z) < (halfLen + 0.35);
+        const closeTop   = Math.abs(player.position.y - topY) < 0.18;
+
+        if(withinLane && withinZ && closeTop){
+          player.position.y = topY;
+          vy = 0;
+          isJumping = false;
+          onPlatform = true;
+          currentPlatform = { kind:'platform', ref: pf, topY };
+          return;
+        }
+      }
+    }
+
+    /* Lifecycle */
+    function resetGame(){
+      trains.forEach(t=>scene.remove(t)); trains = [];
+      barricades.forEach(b=>scene.remove(b)); barricades = [];
+      stones.forEach(s=>scene.remove(s)); stones = [];
+      platforms.forEach(p=>scene.remove(p)); platforms = [];
+      coinMeshes.forEach(c=>scene.remove(c)); coinMeshes = [];
+
+      score = 0; coins = 0;
+      speed = 6; vy = 0;
+      isJumping=false; isSliding=false; slideTimer=0;
+      onPlatform = false; currentPlatform = null;
+      playerLane = 1;
+      player.position.set(LANES[playerLane], FLOOR_Y, 0);
+
+      trainTimer = 0; coinTimer = 0; stoneTimer = 0;
+      barricadeTimer = 0; platformTimer = 0; difficultyTimer = 0;
+
+      hudUpdate();
+    }
+
+    function startGame(){
+      menu.style.display='none';
+      highscore.style.display='none';
+      gameDiv.style.display='block';
+      hud.style.display='flex';
+      hint.style.display='block';
+
+      if(!renderer){
+        initThree();
+        createLighting();
+        createTracks();
+        createPlayer();
+        document.addEventListener('touchstart', onTouchStart, {passive:true});
+        document.addEventListener('touchend', onTouchEnd, {passive:true});
+        document.addEventListener('keydown', onKeyDown);
+      }
+
+      resetGame();
+      running = true;
+      clock.start();
+      animate();
+    }
+    function showHighScore(){
+      menu.style.display='none';
+      highscore.style.display='flex';
+      bestScoreText.textContent = 'Best: ' + best;
+    }
+    function backToMenu(){
+      highscore.style.display='none';
+      menu.style.display='flex';
+    }
+    function exitGame(){ alert('Thanks for playing!'); }
+    function gameOver(){
+      running = false;
+      clock.stop();
+      if(score > best){
+        best = score;
+        localStorage.setItem('railRunnerBest', best);
+      }
+      bestText.textContent = 'Best: ' + best;
+      alert('Game Over\nScore: '+score+' | Coins: '+coins+' | Best: '+best+'\nTap Start to try again.');
+      gameDiv.style.display='none';
+      hud.style.display='none';
+      hint.style.display='none';
+      menu.style.display='flex';
+    }
+
+    /* Main loop */
+    function animate(){
+      if(!running) return;
+      const dt = Math.min(clock.getDelta(), 0.033);
+
+      // Gentle difficulty scaling
+      difficultyTimer += dt;
+      if(difficultyTimer > 3.2){
+        speed = Math.min(speed + 0.15, 18);
+        difficultyTimer = 0;
+      }
+
+      // Lane tween
+      const targetX = LANES[playerLane];
+      player.position.x += (targetX - player.position.x) * Math.min(1, dt*10);
+
+      // Jump/slide physics
+      if(isJumping){
+        vy += GRAVITY * dt;
+        player.position.y += vy * dt;
+
+        // Land on trains/platforms safely
+        handleTrainLanding();
+        if(!onPlatform) handlePlatformLanding();
+
+        // Ground landing if not on platform
+        if(player.position.y <= FLOOR_Y && !onPlatform){
+          player.position.y = FLOOR_Y;
+          vy = 0;
+          isJumping = false;
+        }
+      }
+
+      if(isSliding){
+        slideTimer -= dt;
+        player.rotation.x = -0.28;
+        if(onPlatform && currentPlatform){
+          player.position.y = currentPlatform.topY - 0.08;
+        } else {
+          player.position.y = FLOOR_Y * 0.92;
+        }
+        if(slideTimer <= 0){
+          isSliding = false;
+          player.rotation.x = 0;
+          if(onPlatform && currentPlatform){
+            player.position.y = currentPlatform.topY;
+          } else {
+            player.position.y = FLOOR_Y;
+          }
+        }
+      }
+
+      // If standing on a moving/scrolling platform, drop off when it ends
+      if(onPlatform && currentPlatform){
+        if(currentPlatform.kind === 'train'){
+          const len = currentPlatform.ref.userData.len;
+          const halfLen = len/2;
+          const passedEnd = player.position.z > currentPlatform.ref.position.z + halfLen + 0.35;
+          if(passedEnd){
+            onPlatform = false; currentPlatform = null;
+            isJumping = true; vy = -2; // gentle drop
+          }
+        } else {
+          const len = currentPlatform.ref.userData.len;
+          const halfLen = len/2;
+          const passedEnd = player.position.z > currentPlatform.ref.position.z + halfLen + 0.35;
+          if(passedEnd){
+            onPlatform = false; currentPlatform = null;
+            isJumping = true; vy = -2;
+          }
+        }
+      }
+
+      // Spawning rhythm
+      trainTimer += dt; coinTimer += dt; stoneTimer += dt; barricadeTimer += dt; platformTimer += dt;
+      if(trainTimer > 0.95){ spawnTrain(); trainTimer = 0; }
+      if(coinTimer > 0.85){ spawnCoinsRow(); coinTimer = 0; }
+      if(stoneTimer > 4.8){ spawnStone(); stoneTimer = 0; }
+      if(barricadeTimer > 2.8){ spawnBarricade(); barricadeTimer = 0; }
+      if(platformTimer > 3.6){ spawnPlatform(); platformTimer = 0; }
+
+      // Move world elements forward (towards player)
+      trains.forEach(tr=>{ tr.position.z += speed * dt * 1.2; });
+      trains = trains.filter(tr=>{
+        if(tr.position.z > 6){
+          if(onPlatform && currentPlatform && currentPlatform.kind==='train' && currentPlatform.ref === tr){
+            onPlatform = false; currentPlatform = null; isJumping = true; vy = -2;
+          }
+          scene.remove(tr); return false;
+        }
+        return true;
+      });
+
+      barricades.forEach(b=>{ b.position.z += speed * dt; });
+      barricades = barricades.filter(b=>{
+        if(b.position.z > 6){ scene.remove(b); return false; }
+        return true;
+      });
+
+      coinMeshes.forEach(c=>{
+        c.position.z += speed * dt;
+        c.rotation.z += dt * 3;
+      });
+      coinMeshes = coinMeshes.filter(c=>{
+        if(c.position.z > 6){ scene.remove(c); return false; }
+        return true;
+      });
+
+      stones.forEach(s=>{ s.position.z += speed * dt; });
+      stones = stones.filter(s=>{
+        if(s.position.z > 6){ scene.remove(s); return false; }
+        return true;
+      });
+
+      platforms.forEach(pf=>{ pf.position.z += speed * dt; });
+      platforms = platforms.filter(pf=>{
+        if(pf.position.z > 10){
+          if(onPlatform && currentPlatform && currentPlatform.kind==='platform' && currentPlatform.ref === pf){
+            onPlatform = false; currentPlatform = null; isJumping = true; vy = -2;
+          }
+          scene.remove(pf); return false;
+        }
+        return true;
+      });
+
+      // Player hitbox for interactions (no train death)
+      const playerBox = {
+        x: player.position.x,
+        y: player.position.y+0.9,
+        z: player.position.z,
+        w: 0.7,
+        h: (isSliding ? 0.9 : 1.8),
+        d: 0.6
+      };
+
+      // Barricade bump (slow only if not sliding)
+      for(const b of barricades){
+        const bBox = { x:b.position.x, y:b.position.y, z:b.position.z, w:0.9, h:0.35, d:0.65 };
+        const overlap = aabbIntersect(playerBox, bBox, 0.12);
+        if(overlap && !isSliding){
+          player.position.z -= 0.2;
+          speed = Math.max(5.5, speed - 0.25);
+        }
+      }
+
+      // Coins: collect
+      for(let i=coinMeshes.length-1;i>=0;i--){
+        const c = coinMeshes[i];
+        const cBox = { x:c.position.x, y:c.position.y, z:c.position.z, w:0.5, h:0.5, d:0.5 };
+        if(aabbIntersect(playerBox, cBox, 0.2)){
+          coins += 1;
+          score += 100;
+          scene.remove(c);
+          coinMeshes.splice(i,1);
+        }
+      }
+
+      // Stones: ONLY fail cause (near foot level)
+      for(const s of stones){
+        const sBox = { x:s.position.x, y:s.position.y, z:s.position.z, w:0.5, h:0.2, d:0.5 };
+        const footLevel = onPlatform && currentPlatform ? currentPlatform.topY : FLOOR_Y;
+        const nearFoot = Math.abs(player.position.y - footLevel) <= 0.12;
+        if(nearFoot && aabbIntersect(playerBox, sBox, 0.1)){
+          gameOver();
+          renderer.render(scene, camera);
+          return;
+        }
+      }
+
+      // Scoring & camera follow
+      score += Math.floor(speed * 1.05);
+      camera.position.z = 8 + Math.sin(performance.now()*0.0007)*0.2;
+      camera.position.x += (player.position.x - camera.position.x) * dt * 3;
+      camera.lookAt(player.position.x, 1.6, 0);
+
+      hudUpdate();
+      renderer.render(scene, camera);
+      requestAnimationFrame(animate);
+    }
+
+    /* Initialize UI text */
+    bestText.textContent = 'Best: ' + best;
+    bestScoreText.textContent = 'Best: ' + best;
+
+    // Public UI actions bound in HTML
+  </script>
+
+  <script>
+    // Bind UI functions in a separate script to keep things clear
+    function startGame(){
+      // elements are in outer scope; functions are defined there
+      if(!window.renderer){
+        // init and start are defined in the outer script
+      }
+      // We call the outer startGame via window because of script separation
+    }
+  </script>
+
+  <script>
+    // Re-declare startGame etc. in the same scope as the game for clarity
+    // This block must come after the game core script above to access its functions/vars.
+
+    // Overwrite startGame with the real one
+    window.startGame = function(){
+      menu.style.display='none';
+      highscore.style.display='none';
+      gameDiv.style.display='block';
+      hud.style.display='flex';
+      hint.style.display='block';
+
+      if(!renderer){
+        initThree();
+        createLighting();
+        createTracks();
+        createPlayer();
+        document.addEventListener('touchstart', onTouchStart, {passive:true});
+        document.addEventListener('touchend', onTouchEnd, {passive:true});
+        document.addEventListener('keydown', onKeyDown);
+      }
+
+      resetGame();
+      running = true;
+      clock.start();
+      animate();
+    };
+
+    window.showHighScore = function(){
+      menu.style.display='none';
+      highscore.style.display='flex';
+      bestScoreText.textContent = 'Best: ' + best;
+    };
+
+    window.backToMenu = function(){
+      highscore.style.display='none';
+      menu.style.display='flex';
+    };
+
+    window.exitGame = function(){ alert('Thanks for playing!'); };
+  </script>
+</body>
+</html>
